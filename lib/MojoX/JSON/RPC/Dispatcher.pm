@@ -5,6 +5,23 @@ use Mojo::JSON qw(decode_json);
 use MojoX::JSON::RPC::Dispatcher::Method;
 use MojoX::JSON::RPC::Service;
 
+use Scalar::Util qw(blessed);
+use Variable::Disposition qw();
+
+# Generic handler for responses
+sub _response_handler {
+    my ($self, $rpc_response) = @_;
+    my $res = $self->tx->res;
+    $res->code(
+        $self->_translate_error_code_to_status(
+            ref $rpc_response eq 'HASH' && exists $rpc_response->{error}
+            ? $rpc_response->{error}->{code}
+            : q{}
+        ));
+    $res->headers->content_type('application/json-rpc');
+    return $self->render(json => $rpc_response);
+}
+
 # process JSON-RPC call
 sub call {
     my ($self) = @_;
@@ -13,17 +30,28 @@ sub call {
     if ( !$rpc_response ) {    # is notification
         $self->tx->res->code(204);
         return $self->rendered;
+      }
+
+    my $result = ref $rpc_response eq 'HASH' && exists $rpc_response->{result} ? $rpc_response->{result} : undef;
+    if(blessed($result) && $result->isa('Future')) {
+        Variable::Disposition::retain_future(
+            $result->on_done(sub {
+                # Successful response, return it
+                $rpc_response->{result} = shift;
+                $self->_response_handler($rpc_response);
+            })->on_fail(sub {
+                # Failure response - same handler can deal with these
+                $rpc_response->{error}{message} = shift;
+                $rpc_response->{error}{code} ||= '';
+                $rpc_response->{error}{data} ||= '';
+                delete $rpc_response->{result};
+                $self->_response_handler($rpc_response);
+            })->else_done
+        );
+        return $self->render_later;
+    } else {
+        return $self->_response_handler($rpc_response)
     }
-    my $res = $self->tx->res;
-    $res->code(
-        $self->_translate_error_code_to_status(
-            ref $rpc_response eq 'HASH' && exists $rpc_response->{error}
-            ? $rpc_response->{error}->{code}
-            : q{}
-        )
-    );
-    $res->headers->content_type('application/json-rpc');
-    return $self->render(json => $rpc_response);
 }
 
 sub _acquire_methods {
